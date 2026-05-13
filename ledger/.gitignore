@@ -1,0 +1,7 @@
+.admin-key
+.env
+postgres-data/
+bin/
+*.log
+.DS_Store
+._*

@@ -1,0 +1,57 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ledger
+      POSTGRES_PASSWORD: ${PG_PASSWORD:?PG_PASSWORD required in .env}
+      POSTGRES_DB: ledger
+    volumes:
+      - ./postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "ledger"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - ledger
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "60", "1", "--appendonly", "no"]
+    networks:
+      - ledger
+
+  sidecar:
+    build: ./sidecar
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://ledger:${PG_PASSWORD}@postgres:5432/ledger?sslmode=disable
+      REDIS_URL: redis://redis:6379/0
+      LISTEN_ADDR: 0.0.0.0:18080
+      ADMIN_PUBKEY_HEX: ${ADMIN_PUBKEY_HEX:-}
+      ADMIN_PRIV_KEY_HEX: ${ADMIN_PRIV_KEY_HEX:-}
+      TREASURY_USERNAME: ${TREASURY_USERNAME:-TREASURY}
+      ADMIN_SESSION_SECRET: ${ADMIN_SESSION_SECRET:-}
+      DISCOURSE_CONNECT_SECRET: ${DISCOURSE_CONNECT_SECRET:-}
+      DISCOURSE_WEBHOOK_SECRET: ${DISCOURSE_WEBHOOK_SECRET:-}
+      FORUM_BASE_URL: ${FORUM_BASE_URL:-}
+      WALLET_CALLBACK_URL: ${WALLET_CALLBACK_URL:-}
+      WALLET_ALLOW_HEADER_AUTH: ${WALLET_ALLOW_HEADER_AUTH:-}
+      WALLET_DEV_HEADER_AUTH_TOKEN: ${WALLET_DEV_HEADER_AUTH_TOKEN:-}
+    ports:
+      # Bind on host's docker bridge gateway so a standard discourse_docker
+      # container can reach the sidecar; also bind localhost for host-only curl
+      # tests. These defaults do not expose the sidecar publicly.
+      - "${LEDGER_BIND_ADDR:-172.17.0.1}:${LEDGER_HOST_PORT:-18080}:18080"
+      - "${LEDGER_LOCAL_BIND_ADDR:-127.0.0.1}:${LEDGER_HOST_PORT:-18080}:18080"
+    networks:
+      - ledger
+
+networks:
+  ledger:
+    driver: bridge

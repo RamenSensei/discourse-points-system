@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Forum Points — Admin</title>
+  <link rel="stylesheet" href="/wallet/admin/static/style.css">
+</head>
+<body>
+  <div id="app">
+
+    <!-- ============================ LOGIN ============================ -->
+    <section id="login-view" class="login">
+      <div class="login__card">
+        <header>
+          <div class="login__logo">F</div>
+          <h1>Forum Points</h1>
+          <p class="login__sub">Administrator's Console</p>
+        </header>
+        <p class="login__hint">
+          Paste your administrator <strong>Ed25519 private key</strong> (128 hex characters)
+          below. The key never leaves this browser — it signs a one-time challenge
+          issued by the server, and only the resulting signature crosses the wire.
+        </p>
+        <textarea id="login-key" placeholder="128 hexadecimal characters" rows="2"></textarea>
+        <button id="login-btn" type="button">Sign challenge &amp; continue</button>
+        <p id="login-error" class="login__error"></p>
+      </div>
+    </section>
+
+    <!-- ============================ MAIN ============================ -->
+    <main id="main-view" hidden>
+
+      <!-- masthead -->
+      <header class="masthead">
+        <div class="masthead__brand">
+          <div>
+            <h1 class="masthead__title">Forum Points</h1>
+            <p class="masthead__est">Vol. 1 · Administrator's Console · Est. 2026</p>
+          </div>
+          <div class="masthead__date" id="masthead-date"></div>
+        </div>
+
+        <nav class="topnav">
+          <button class="nav-item" data-route="dashboard">Dashboard</button>
+          <button class="nav-item" data-route="rewards">Rewards</button>
+          <button class="nav-item" data-route="accounts">Accounts</button>
+          <button class="nav-item" data-route="txs">Transactions</button>
+          <button class="nav-item" data-route="audit">Audit</button>
+        </nav>
+
+        <div class="toolbar">
+          <div class="me">
+            Authenticated as <span class="me__pub" id="me-pub"></span>
+          </div>
+          <button id="logout-btn" class="ghost">Sign out</button>
+        </div>
+      </header>
+
+      <!-- ============================ DASHBOARD ============================ -->
+      <div data-page="dashboard" class="page">
+        <p class="kicker">The Ledger</p>
+        <h2 class="page__title">Dashboard</h2>
+        <p class="page__intro">
+          A live read of the system of record — supply conservation, treasury
+          reserves, and the latest signed tree head broadcast to the public.
+        </p>
+
+        <div class="grid grid--3">
+          <div class="card stat">
+            <div class="stat__label">Total supply</div>
+            <div class="stat__value" id="stat-supply">—</div>
+            <div class="stat__sub" id="stat-supply-sub">cap 50,000,000</div>
+          </div>
+          <div class="card stat">
+            <div class="stat__label">Treasury balance</div>
+            <div class="stat__value" id="stat-treasury">—</div>
+            <div class="stat__sub" id="stat-treasury-sub"></div>
+          </div>
+          <div class="card stat">
+            <div class="stat__label">Activated accounts</div>
+            <div class="stat__value" id="stat-activated">—</div>
+            <div class="stat__sub" id="stat-activated-sub"></div>
+          </div>
+        </div>
+
+        <div class="grid grid--2">
+          <div class="card">
+            <div class="card__head">
+              <h3>Signed Tree Head</h3>
+              <span class="pill" id="sth-pill">Live</span>
+            </div>
+            <dl class="kv" id="sth-kv"></dl>
+            <details class="raw">
+              <summary>Canonical message &amp; signature</summary>
+              <pre id="sth-raw"></pre>
+            </details>
+          </div>
+          <div class="card">
+            <div class="card__head">
+              <h3>OpenTimestamps anchor</h3>
+              <span class="pill" id="ots-pill"></span>
+            </div>
+            <dl class="kv" id="ots-kv"></dl>
+            <p class="card__note">
+              Once Bitcoin confirms, the receipt can be upgraded via
+              <code>ots upgrade</code>. Each daily checkpoint becomes
+              independently auditable against the public chain.
+            </p>
+          </div>
+        </div>
+      </div>
+
+      <!-- ============================ REWARDS ============================ -->
+      <div data-page="rewards" class="page" hidden>
+        <p class="kicker">Configuration</p>
+        <h2 class="page__title">Reward Schedule</h2>
+        <p class="page__intro">
+          Per-event payouts disbursed by the sidecar when Discourse webhooks
+          fire. Edits take effect immediately and are recorded to the audit
+          trail.
+        </p>
+        <div id="rewards-list" class="reward-list"></div>
+      </div>
+
+      <!-- ============================ ACCOUNTS ============================ -->
+      <div data-page="accounts" class="page" hidden>
+        <p class="kicker">Roster</p>
+        <h2 class="page__title">Accounts</h2>
+        <p class="page__intro">The two hundred largest balances on the ledger.</p>
+        <table class="table" id="accounts-table">
+          <thead>
+            <tr>
+              <th>#&nbsp;ID</th>
+              <th>Username</th>
+              <th>Status</th>
+              <th class="right">Balance</th>
+              <th class="right">Nonce</th>
+              <th>Public key</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+
+      <!-- ============================ TXS ============================ -->
+      <div data-page="txs" class="page" hidden>
+        <p class="kicker">Activity</p>
+        <h2 class="page__title">Recent Transactions</h2>
+        <p class="page__intro">The latest twenty-five entries committed to the ledger.</p>
+        <table class="table table--txs" id="txs-table">
+          <thead>
+            <tr>
+              <th>Leaf&nbsp;#</th>
+              <th>When (UTC)</th>
+              <th>Type</th>
+              <th>From</th>
+              <th>To</th>
+              <th class="right">Amount</th>
+              <th>tx_hash</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+
+      <!-- ============================ AUDIT ============================ -->
+      <div data-page="audit" class="page" hidden>
+        <p class="kicker">Verification</p>
+        <h2 class="page__title">Audit &amp; Anchoring</h2>
+        <p class="page__intro">
+          Tools for cross-checking the ledger against external witnesses and
+          for anchoring tree heads in independent timestamping authorities.
+        </p>
+
+        <div class="card">
+          <h3>Digest awaiting anchor</h3>
+          <p class="card__note">
+            Hash of the canonical signed tree head. Paste this 32-byte digest
+            into <code>ots stamp</code>, an RFC 3161 TSA, or any other
+            timestamping calendar.
+          </p>
+          <pre id="audit-digest" class="mono">—</pre>
+          <div class="actions">
+            <button id="audit-refresh">Refresh digest</button>
+            <button id="audit-copy" class="ghost">Copy digest</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>Independent verification</h3>
+          <p class="card__note">
+            Anyone may replay the public ledger and audit balances and
+            inclusion proofs without trusting this server.
+          </p>
+          <pre class="mono">go run ./cmd/ledger-verify -target https://forum.example.com/wallet -samples 100</pre>
+        </div>
+      </div>
+
+    </main>
+  </div>
+  <script src="/wallet/admin/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Forum Points — Public Ledger</title>
+  <link rel="stylesheet" href="/wallet/explorer/static/style.css">
+</head>
+<body>
+  <div id="app">
+
+    <!-- ================ MASTHEAD ================ -->
+    <header class="masthead">
+      <div class="masthead__inner">
+        <div class="masthead__brand">
+          <a href="/wallet/explorer/" class="brand-link">
+            <h1 class="masthead__title">Forum Points</h1>
+            <p class="masthead__est">Public Ledger · Vol. 1 · Est. 2026</p>
+          </a>
+          <div class="masthead__date" id="masthead-date"></div>
+        </div>
+
+        <nav class="topnav">
+          <a class="nav-item" data-tab="recent" href="/wallet/explorer/">Recent Transactions</a>
+          <a class="nav-item" data-tab="checkpoints" href="/wallet/explorer/?tab=checkpoints">Tree Heads</a>
+          <a class="nav-item" data-tab="audit" href="/wallet/explorer/?tab=audit">How to Audit</a>
+        </nav>
+
+        <form id="search-form" class="search">
+          <input id="search-input" type="text" placeholder="Search by tx_hash · leaf #16 · @username · STH size" autocomplete="off" autocapitalize="off" spellcheck="false">
+          <button type="submit">Look up</button>
+        </form>
+      </div>
+    </header>
+
+    <!-- ================ MAIN ================ -->
+    <main id="main">
+      <!-- views are injected here by app.js -->
+      <div class="loading">Loading…</div>
+    </main>
+
+    <!-- ================ FOOTER ================ -->
+    <footer class="colophon">
+      <p>
+        Every entry below is a permanent, signed entry in a Merkle log.
+        Independently verifiable at
+        <code>https://forum.example.com/wallet/api/v1/log/</code>.
+      </p>
+    </footer>
+
+  </div>
+  <script src="/wallet/explorer/static/app.js"></script>
+</body>
+</html>

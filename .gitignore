@@ -1,0 +1,32 @@
+.DS_Store
+._*
+
+# Secrets
+.env
+.env.*
+!.env.example
+.admin-key
+*.key
+*.pem
+
+# Runtime state
+postgres-data/
+ledger/postgres-data/
+bin/
+ledger/bin/
+*.log
+
+# Backups and generated archives
+backups/
+*.sql
+*.dump
+*.tar
+*.tar.gz
+*.zip
+
+# Source migrations are required by the sidecar.
+!ledger/sidecar/internal/store/migrations/*.sql
+
+# Go/build artifacts
+ledger/sidecar/ledger-witness
+coverage.out
