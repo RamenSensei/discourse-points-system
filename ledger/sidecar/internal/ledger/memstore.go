@@ -69,6 +69,10 @@ func (t *memTx) Rollback(ctx context.Context) error {
 	return nil
 }
 
+func (t *memTx) LockLedger(ctx context.Context) error {
+	return nil
+}
+
 func (t *memTx) GetAccountByPubKey(ctx context.Context, pubkey []byte) (*Account, error) {
 	if len(pubkey) == 0 {
 		return nil, nil
@@ -94,6 +98,20 @@ func (t *memTx) GetAccountByDiscourseID(ctx context.Context, did int64) (*Accoun
 	c := *a
 	c.Pubkey = bytes.Clone(a.Pubkey)
 	return &c, nil
+}
+
+func (t *memTx) GetAccountsByDiscourseIDs(ctx context.Context, dids []int64) (map[int64]*Account, error) {
+	out := make(map[int64]*Account, len(dids))
+	for _, did := range dids {
+		a, ok := t.byDiscourseID[did]
+		if !ok {
+			continue
+		}
+		c := *a
+		c.Pubkey = bytes.Clone(a.Pubkey)
+		out[did] = &c
+	}
+	return out, nil
 }
 
 func (t *memTx) UpsertAccount(ctx context.Context, a *Account) error {

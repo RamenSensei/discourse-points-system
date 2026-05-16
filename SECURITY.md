@@ -13,6 +13,8 @@ Never commit:
 - `.env`
 - `.admin-key`
 - `ADMIN_PRIV_KEY_HEX`
+- `REWARD_PRIV_KEY_HEX`
+- `STH_PRIV_KEY_HEX`
 - Discourse API keys
 - Discourse webhook secrets
 - database dumps
@@ -33,7 +35,8 @@ Defended:
 Not fully defended:
 
 - Operator censorship: the operator can refuse to relay transactions.
-- Admin key compromise: a leaked admin private key controls treasury actions.
+- Online key compromise: leaked hot keys can sign their configured reward or
+  STH duties; a leaked treasury/admin key controls treasury actions.
 - Browser compromise/XSS: a compromised browser can sign as the user.
 - Split view without witnesses: run an independent witness for stronger audit.
 
@@ -42,8 +45,11 @@ Not fully defended:
 - Leave `WALLET_ALLOW_HEADER_AUTH` empty in production.
 - Use HTTPS only.
 - Set `ADMIN_SESSION_SECRET` to at least 32 random bytes.
-- Store `ADMIN_PRIV_KEY_HEX` offline unless automatic rewards/STH signing need
-  it in the sidecar environment.
+- Store `ADMIN_PRIV_KEY_HEX` offline. Use separate `REWARD_PRIV_KEY_HEX` and
+  `STH_PRIV_KEY_HEX` for online reward and checkpoint signing.
+- Keep `OTS_CALENDAR_ALLOWLIST` tight if you allow admin-triggered anchoring.
+- Tune `WALLET_RATE_LIMIT_PER_MINUTE` and `WALLET_RATE_LIMIT_BURST` for your
+  forum traffic, and keep external reverse-proxy rate limits enabled.
 - Rotate Discourse webhook and DiscourseConnect secrets after any suspected
   leak.
 - Back up Postgres regularly and test restores.

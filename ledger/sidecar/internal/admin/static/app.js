@@ -69,12 +69,17 @@ function parsePrivKey(hex) {
 
 // ----- API client -----
 
+let CSRF_TOKEN = "";
+
 async function api(method, path, body = null) {
   const opts = {
     method,
     credentials: "same-origin",
     headers: { "Accept": "application/json" },
   };
+  if (!["GET", "HEAD", "OPTIONS"].includes(method) && CSRF_TOKEN) {
+    opts.headers["X-FP-CSRF"] = CSRF_TOKEN;
+  }
   if (body !== null) {
     opts.headers["Content-Type"] = "application/json";
     opts.body = JSON.stringify(body);
@@ -118,6 +123,7 @@ async function doLogin() {
     errEl.textContent = "Login failed: " + (r.data?.error || r.status);
     return;
   }
+  CSRF_TOKEN = r.data?.csrf_token || "";
   // Clear key from memory + DOM
   $("#login-key").value = "";
   seed.fill(0);
@@ -126,6 +132,7 @@ async function doLogin() {
 
 async function logout() {
   await api("POST", "/logout");
+  CSRF_TOKEN = "";
   location.reload();
 }
 
@@ -225,9 +232,10 @@ async function renderRewards() {
   for (const cfg of r.data) {
     const row = document.createElement("div");
     row.className = "reward";
+    const eventType = escapeHTML(cfg.event_type);
     row.innerHTML = `
       <div class="reward__name">
-        ${cfg.event_type}
+        ${eventType}
         <small>${describeEvent(cfg.event_type)}</small>
       </div>
       <div class="reward__amt">
@@ -300,9 +308,9 @@ async function renderTxs() {
     tr.innerHTML = `
       <td>${t.leaf_index}</td>
       <td>${fmtTime(t.created_at)}</td>
-      <td>${t.tx_type} ${tag}</td>
-      <td>${fromName}</td>
-      <td>${toName}</td>
+      <td>${escapeHTML(t.tx_type)} ${tag}</td>
+      <td>${escapeHTML(fromName)}</td>
+      <td>${escapeHTML(toName)}</td>
       <td class="right ${amtCls}">${t.amount ? fmtNum(t.amount) : "—"}</td>
       <td class="mono">${t.tx_hash_hex.slice(0,12)}…</td>
     `;
@@ -315,6 +323,7 @@ async function renderTxs() {
 async function renderAudit() {
   await refreshAuditDigest();
   $("#audit-refresh").onclick = refreshAuditDigest;
+  $("#audit-anchor").onclick = anchorDigest;
   $("#audit-copy").onclick = () => {
     const txt = $("#audit-digest").textContent;
     navigator.clipboard.writeText(txt);
@@ -323,12 +332,30 @@ async function renderAudit() {
   };
 }
 async function refreshAuditDigest() {
-  const r = await api("POST", "/anchor-sth");
+  const r = await api("GET", "/anchor-sth");
   if (!r.ok) {
     $("#audit-digest").textContent = "(error: " + (r.data?.error || r.status) + ")";
     return;
   }
   $("#audit-digest").textContent = r.data.digest_to_anchor;
+}
+async function anchorDigest() {
+  const btn = $("#audit-anchor");
+  btn.disabled = true;
+  btn.textContent = "Anchoring...";
+  const r = await api("POST", "/anchor-sth", {});
+  btn.disabled = false;
+  if (!r.ok) {
+    $("#audit-digest").textContent = "(error: " + (r.data?.error || r.status) + ")";
+    btn.textContent = "Anchor with OTS";
+    return;
+  }
+  $("#audit-digest").textContent =
+    `${r.data.digest_to_anchor}\nreceipt_bytes=${r.data.receipt_len}` +
+    (r.data.already_anchored ? "\nstatus=already anchored" : "\nstatus=anchored");
+  btn.textContent = r.data.already_anchored ? "Already anchored" : "Anchored";
+  setTimeout(() => btn.textContent = "Anchor with OTS", 1800);
+  await renderDashboard();
 }
 
 function escapeHTML(s) {
@@ -348,6 +375,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   // Check if already authed
   const r = await api("GET", "/whoami");
   if (r.ok) {
+    CSRF_TOKEN = r.data?.csrf_token || "";
     bootMain(r.data.admin_pubkey_hex);
   }
 });

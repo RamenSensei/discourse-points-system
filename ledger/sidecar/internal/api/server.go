@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -29,7 +30,10 @@ type Server struct {
 	// DevHeaderAuthToken enables X-Discourse-* header auth only when callers
 	// also present this bearer token in X-Wallet-Dev-Auth. Leave empty in prod.
 	DevHeaderAuthToken string
+	RateLimitPerMinute int
+	RateLimitBurst     int
 	r                  *chi.Mux
+	limiter            *rateLimiter
 }
 
 // AdminMounter is implemented by *admin.Service. Kept as interface so the api
@@ -58,11 +62,14 @@ type HistoryEntry struct {
 
 func (s *Server) Routes() *chi.Mux {
 	s.r = chi.NewRouter()
+	s.r.Use(securityHeaders)
+	s.r.Use(s.rateLimitMiddleware())
 	s.r.Use(jsonContentType)
 	s.r.Get("/api/v1/health", s.health)
 	s.r.Get("/api/v1/me", s.me)
 	s.r.Post("/api/v1/me/register", s.register)
 	s.r.Get("/api/v1/balance/{discourse_id}", s.balance)
+	s.r.Post("/api/v1/balances", s.balances)
 	s.r.Get("/api/v1/history/{discourse_id}", s.history)
 	s.r.Post("/api/v1/tx", s.submitTx)
 	s.r.Get("/api/v1/treasury", s.treasury)
@@ -306,6 +313,83 @@ func (s *Server) balance(w http.ResponseWriter, r *http.Request) {
 	out["registered"] = activated
 	out["activated"] = activated
 	writeJSON(w, http.StatusOK, out)
+}
+
+type balancesReq struct {
+	DiscourseIDs []int64 `json:"discourse_ids"`
+}
+
+func (s *Server) balances(w http.ResponseWriter, r *http.Request) {
+	var req balancesReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	ids, err := normalizeDiscourseIDs(req.DiscourseIDs, 200)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+
+	stx, err := s.Store.Begin(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	defer stx.Rollback(r.Context())
+
+	found, err := stx.GetAccountsByDiscourseIDs(r.Context(), ids)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	accounts := make([]map[string]any, 0, len(ids))
+	for _, id := range ids {
+		a := found[id]
+		if a == nil {
+			accounts = append(accounts, map[string]any{
+				"discourse_id": id,
+				"balance":      0,
+				"registered":   false,
+				"activated":    false,
+			})
+			continue
+		}
+		activated := len(a.Pubkey) > 0
+		out := accountResponse(a, false)
+		out["registered"] = activated
+		out["activated"] = activated
+		accounts = append(accounts, out)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"count":    len(accounts),
+		"accounts": accounts,
+	})
+}
+
+func normalizeDiscourseIDs(raw []int64, max int) ([]int64, error) {
+	if len(raw) == 0 {
+		return nil, errors.New("discourse_ids required")
+	}
+	if len(raw) > max {
+		return nil, fmt.Errorf("too many discourse_ids; max %d", max)
+	}
+	seen := make(map[int64]struct{}, len(raw))
+	out := make([]int64, 0, len(raw))
+	for _, id := range raw {
+		if id < ledger.TreasuryDscID {
+			return nil, errors.New("bad discourse_id")
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	if len(out) == 0 {
+		return nil, errors.New("discourse_ids required")
+	}
+	return out, nil
 }
 
 func (s *Server) history(w http.ResponseWriter, r *http.Request) {

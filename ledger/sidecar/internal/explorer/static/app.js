@@ -501,7 +501,7 @@ async function viewSTH({ size }) {
     return;
   }
   const currentSTH = await apiGet("/log/sth");
-  const adminPubHex = currentSTH.admin_pubkey_hex;
+  const adminPubHex = cp.admin_pubkey_hex || currentSTH.admin_pubkey_hex;
 
   const canonical = `fp.sth.v1|${cp.tree_size}|${cp.root_hash_hex}|${cp.timestamp_ms}`;
 

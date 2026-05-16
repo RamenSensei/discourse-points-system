@@ -14,8 +14,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net/http"
+	"net/url"
 	"path"
 	"strings"
 	"time"
@@ -24,6 +26,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/forum-points/ledger/internal/ledger"
+	"github.com/forum-points/ledger/internal/ots"
 	"github.com/forum-points/ledger/internal/txlog"
 )
 
@@ -38,11 +41,14 @@ const (
 )
 
 type Service struct {
-	AdminPubKey   ed25519.PublicKey
-	SessionSecret []byte
-	Pool          *pgxpool.Pool
-	TxLog         *txlog.Service // optional, for STH info
-	SecureCookies bool
+	AdminPubKey          ed25519.PublicKey
+	SessionSecret        []byte
+	Pool                 *pgxpool.Pool
+	TxLog                *txlog.Service // optional, for STH info
+	SecureCookies        bool
+	OTSCalendarURL       string
+	OTSCalendarAllowlist []string
+	SubmitOTS            func(ctx context.Context, calendarURL string, digest []byte) ([]byte, error)
 }
 
 // Mount installs /admin/* routes on the given router.
@@ -66,6 +72,7 @@ func (s *Service) Mount(r chi.Router) {
 		r.Post("/admin/api/reward-config", s.updateRewardConfig)
 		r.Get("/admin/api/recent-txs", s.recentTxs)
 		r.Get("/admin/api/accounts", s.accounts)
+		r.Get("/admin/api/anchor-sth", s.anchorDigest)
 		r.Post("/admin/api/anchor-sth", s.anchorSTH)
 	})
 }
@@ -188,6 +195,7 @@ func (s *Service) login(w http.ResponseWriter, r *http.Request) {
 		"ok":         true,
 		"admin":      req.PubKeyHex,
 		"expires_at": sess.ExpUnix,
+		"csrf_token": csrfToken(s.SessionSecret, cookieVal),
 	})
 }
 
@@ -200,13 +208,15 @@ func (s *Service) logout(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Service) whoami(w http.ResponseWriter, r *http.Request) {
-	if !s.isAuthed(r) {
+	c, err := s.adminSessionCookie(r)
+	if err != nil {
 		writeErr(w, http.StatusUnauthorized, errors.New("not authenticated"))
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]string{
 		"admin_pubkey_hex": hex.EncodeToString(s.AdminPubKey),
+		"csrf_token":       csrfToken(s.SessionSecret, c.Value),
 	})
 }
 
@@ -245,20 +255,68 @@ func verifySession(s string, secret []byte) (*sessionToken, error) {
 	return &t, nil
 }
 
-func (s *Service) isAuthed(r *http.Request) bool {
-	c, err := r.Cookie(cookieName)
+func csrfToken(secret []byte, sessionValue string) string {
+	return hex.EncodeToString(mac(secret, []byte("csrf|"+sessionValue)))
+}
+
+func validCSRF(secret []byte, sessionValue, got string) bool {
+	want := csrfToken(secret, sessionValue)
+	return hmac.Equal([]byte(got), []byte(want))
+}
+
+func isUnsafeMethod(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return false
+	default:
+		return true
+	}
+}
+
+func sameOriginWrite(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
 	if err != nil {
 		return false
 	}
-	_, err = verifySession(c.Value, s.SessionSecret)
+	return strings.EqualFold(u.Host, r.Host)
+}
+
+func (s *Service) isAuthed(r *http.Request) bool {
+	_, err := s.adminSessionCookie(r)
 	return err == nil
+}
+
+func (s *Service) adminSessionCookie(r *http.Request) (*http.Cookie, error) {
+	c, err := r.Cookie(cookieName)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := verifySession(c.Value, s.SessionSecret); err != nil {
+		return nil, err
+	}
+	return c, nil
 }
 
 func (s *Service) requireAdmin(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !s.isAuthed(r) {
+		c, err := s.adminSessionCookie(r)
+		if err != nil {
 			writeErr(w, http.StatusUnauthorized, errors.New("admin auth required"))
 			return
+		}
+		if isUnsafeMethod(r.Method) {
+			if !sameOriginWrite(r) {
+				writeErr(w, http.StatusForbidden, errors.New("cross-origin admin write rejected"))
+				return
+			}
+			if !validCSRF(s.SessionSecret, c.Value, r.Header.Get("X-FP-CSRF")) {
+				writeErr(w, http.StatusForbidden, errors.New("missing or invalid csrf token"))
+				return
+			}
 		}
 		next.ServeHTTP(w, r)
 	})
@@ -384,9 +442,9 @@ func (s *Service) recentTxs(w http.ResponseWriter, r *http.Request) {
 	limit := 25
 	rows, err := s.Pool.Query(r.Context(), `
 		SELECT t.leaf_index, t.tx_type,
-		       COALESCE((convert_from(t.payload, 'UTF8')::jsonb ->> 'amount')::bigint, 0)           AS amount,
-		       COALESCE((convert_from(t.payload, 'UTF8')::jsonb ->> 'to_discourse_id')::bigint, -1) AS to_did,
-		       COALESCE((convert_from(t.payload, 'UTF8')::jsonb -> 'meta' ->> 'reward_source'),'')  AS reward_source,
+		       COALESCE(t.amount, 0)                                                               AS amount,
+		       COALESCE(t.to_discourse_id, -1)                                                     AS to_did,
+		       COALESCE(t.reward_source, '')                                                       AS reward_source,
 		       to_char(t.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')               AS created_at,
 		       encode(t.tx_hash, 'hex')                                                              AS tx_hash_hex,
 		       COALESCE(a_from.discourse_id, -1)                                                     AS from_did,
@@ -394,7 +452,7 @@ func (s *Service) recentTxs(w http.ResponseWriter, r *http.Request) {
 		       COALESCE(a_from.username, '')                                                         AS from_name
 		  FROM transactions t
 		  LEFT JOIN accounts a_from ON a_from.pubkey = t.signer
-		  LEFT JOIN accounts a_to   ON a_to.discourse_id = COALESCE((convert_from(t.payload, 'UTF8')::jsonb ->> 'to_discourse_id')::bigint, -1)
+		  LEFT JOIN accounts a_to   ON a_to.discourse_id = t.to_discourse_id
 		 ORDER BY t.leaf_index DESC
 		 LIMIT $1`, limit,
 	)
@@ -469,30 +527,154 @@ func (s *Service) accounts(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]any{"count": len(out), "accounts": out})
 }
 
-func (s *Service) anchorSTH(w http.ResponseWriter, r *http.Request) {
-	// Stub: the real anchor happens via the CLI; here we just confirm the
-	// current STH so the admin can copy-paste the digest into an external tool.
+type anchorReq struct {
+	CalendarURL string `json:"calendar_url"`
+	Force       bool   `json:"force"`
+}
+
+type anchorMaterial struct {
+	STH       *txlog.STH
+	Digest    []byte
+	Canonical []byte
+}
+
+func (s *Service) currentAnchorMaterial(ctx context.Context) (*anchorMaterial, error) {
+	if s.TxLog == nil {
+		return nil, errors.New("STH service not configured")
+	}
+	sth, err := s.TxLog.CurrentSTH(ctx)
+	if err != nil {
+		return nil, err
+	}
+	rootBytes, _ := hex.DecodeString(sth.RootHash)
+	canonical := txlog.SignedSTHBytes(sth.TreeSize, rootBytes, sth.TimestampMS)
+	return &anchorMaterial{
+		STH:       sth,
+		Digest:    ots.DigestSTH(canonical),
+		Canonical: canonical,
+	}, nil
+}
+
+func (s *Service) anchorDigest(w http.ResponseWriter, r *http.Request) {
 	if s.TxLog == nil {
 		writeErr(w, http.StatusServiceUnavailable, errors.New("STH service not configured"))
 		return
 	}
-	sth, err := s.TxLog.CurrentSTH(r.Context())
+	mat, err := s.currentAnchorMaterial(r.Context())
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
-	rootBytes, _ := hex.DecodeString(sth.RootHash)
-	canonical := txlog.SignedSTHBytes(sth.TreeSize, rootBytes, sth.TimestampMS)
-	h := sha256.Sum256(canonical)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"sth":              sth,
-		"canonical_msg":    hex.EncodeToString(canonical),
-		"digest_to_anchor": hex.EncodeToString(h[:]),
+		"sth":              mat.STH,
+		"canonical_msg":    hex.EncodeToString(mat.Canonical),
+		"digest_to_anchor": hex.EncodeToString(mat.Digest),
+	})
+}
+
+func (s *Service) anchorSTH(w http.ResponseWriter, r *http.Request) {
+	if s.TxLog == nil {
+		writeErr(w, http.StatusServiceUnavailable, errors.New("STH service not configured"))
+		return
+	}
+	if s.Pool == nil {
+		writeErr(w, http.StatusServiceUnavailable, errors.New("database pool not configured"))
+		return
+	}
+
+	var req anchorReq
+	if r.Body != nil {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+			writeErr(w, http.StatusBadRequest, err)
+			return
+		}
+	}
+
+	mat, err := s.currentAnchorMaterial(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	if mat.STH.TreeSize == 0 {
+		writeErr(w, http.StatusConflict, errors.New("tree is empty; nothing to anchor"))
+		return
+	}
+
+	var existingReceipt []byte
+	_ = s.Pool.QueryRow(r.Context(),
+		`SELECT ots_receipt FROM checkpoints WHERE tree_size = $1`,
+		mat.STH.TreeSize,
+	).Scan(&existingReceipt)
+	if len(existingReceipt) > 0 && !req.Force {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ok":               true,
+			"already_anchored": true,
+			"sth":              mat.STH,
+			"digest_to_anchor": hex.EncodeToString(mat.Digest),
+			"receipt_len":      len(existingReceipt),
+			"receipt_b64":      base64.StdEncoding.EncodeToString(existingReceipt),
+		})
+		return
+	}
+
+	calendar := req.CalendarURL
+	if calendar == "" {
+		calendar = s.OTSCalendarURL
+	}
+	if calendar == "" {
+		calendar = ots.DefaultCalendar
+	}
+	if !s.calendarAllowed(calendar) {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("calendar_url is not allowed: %s", calendar))
+		return
+	}
+	submit := s.SubmitOTS
+	if submit == nil {
+		submit = ots.Submit
+	}
+
+	receipt, err := submit(r.Context(), calendar, mat.Digest)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, err)
+		return
+	}
+	if err := ots.AnchorCheckpoint(r.Context(), s.Pool, mat.STH.TreeSize, receipt); err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"ok":               true,
+		"already_anchored": false,
+		"sth":              mat.STH,
+		"calendar":         calendar,
+		"digest_to_anchor": hex.EncodeToString(mat.Digest),
+		"receipt_len":      len(receipt),
+		"receipt_b64":      base64.StdEncoding.EncodeToString(receipt),
 	})
 }
 
 // --- helpers ---
+
+func (s *Service) calendarAllowed(calendar string) bool {
+	if calendar == "" {
+		return false
+	}
+	allowed := []string{ots.DefaultCalendar}
+	if s.OTSCalendarURL != "" {
+		allowed = append(allowed, s.OTSCalendarURL)
+	}
+	allowed = append(allowed, s.OTSCalendarAllowlist...)
+	for _, candidate := range allowed {
+		if strings.EqualFold(strings.TrimRight(candidate, "/"), strings.TrimRight(calendar, "/")) {
+			return true
+		}
+	}
+	return false
+}
 
 func mac(key, msg []byte) []byte {
 	m := hmac.New(sha256.New, key)

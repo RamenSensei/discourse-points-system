@@ -20,20 +20,27 @@ import (
 
 func cmdAnchorSTH(args []string) {
 	fs := flag.NewFlagSet("anchor-sth", flag.ExitOnError)
-	calendar := fs.String("calendar", "https://a.pool.opentimestamps.org/digest", "OpenTimestamps calendar URL")
+	defaultCalendar := os.Getenv("OTS_CALENDAR_URL")
+	if defaultCalendar == "" {
+		defaultCalendar = ots.DefaultCalendar
+	}
+	calendar := fs.String("calendar", defaultCalendar, "OpenTimestamps calendar URL")
 	_ = fs.Parse(args)
 
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
 		log.Fatal("DATABASE_URL is required")
 	}
-	privHex := os.Getenv("ADMIN_PRIV_KEY_HEX")
+	privHex := os.Getenv("STH_PRIV_KEY_HEX")
 	if privHex == "" {
-		log.Fatal("ADMIN_PRIV_KEY_HEX is required (so we can re-derive admin pubkey)")
+		privHex = os.Getenv("ADMIN_PRIV_KEY_HEX")
+	}
+	if privHex == "" {
+		log.Fatal("STH_PRIV_KEY_HEX is required (legacy fallback: ADMIN_PRIV_KEY_HEX)")
 	}
 	priv, err := hex.DecodeString(privHex)
 	if err != nil || len(priv) != ed25519.PrivateKeySize {
-		log.Fatal("ADMIN_PRIV_KEY_HEX must be 128-char hex Ed25519 private key")
+		log.Fatal("STH_PRIV_KEY_HEX must be 128-char hex Ed25519 private key")
 	}
 
 	ctx := context.Background()
@@ -96,16 +103,19 @@ func cmdPublishSTH(args []string) {
 	_ = fs.Parse(args)
 
 	dsn := os.Getenv("DATABASE_URL")
-	privHex := os.Getenv("ADMIN_PRIV_KEY_HEX")
+	privHex := os.Getenv("STH_PRIV_KEY_HEX")
+	if privHex == "" {
+		privHex = os.Getenv("ADMIN_PRIV_KEY_HEX")
+	}
 	if dsn == "" || privHex == "" {
-		log.Fatal("DATABASE_URL and ADMIN_PRIV_KEY_HEX are required")
+		log.Fatal("DATABASE_URL and STH_PRIV_KEY_HEX are required (legacy fallback: ADMIN_PRIV_KEY_HEX)")
 	}
 	if *apiBase == "" || *apiKey == "" {
 		log.Fatal("--discourse-api and --api-key are required")
 	}
 	priv, err := hex.DecodeString(privHex)
 	if err != nil || len(priv) != ed25519.PrivateKeySize {
-		log.Fatal("ADMIN_PRIV_KEY_HEX malformed")
+		log.Fatal("STH_PRIV_KEY_HEX malformed")
 	}
 
 	ctx := context.Background()

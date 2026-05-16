@@ -15,6 +15,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/forum-points/ledger/internal/ledger"
 )
@@ -32,13 +33,15 @@ type Service struct {
 	AdminPrivKey  ed25519.PrivateKey
 	AdminPubKey   ed25519.PublicKey
 	WebhookSecret []byte
+	adminSignMu   sync.Mutex
 }
 
 // Rewards is the interface for looking up reward amounts and recording dedup events.
 type Rewards interface {
 	GetRewardAmount(ctx context.Context, eventType string) (amount int64, enabled bool, err error)
-	RewardEventExists(ctx context.Context, eventType, eventKey string) (bool, error)
-	RecordRewardEvent(ctx context.Context, eventType, eventKey string, txHash []byte) error
+	TryReserveRewardEvent(ctx context.Context, eventType, eventKey string) (bool, error)
+	CompleteRewardEvent(ctx context.Context, eventType, eventKey string, txHash []byte) error
+	ReleaseRewardEvent(ctx context.Context, eventType, eventKey string) error
 }
 
 // Webhook is the http.Handler that receives Discourse-formatted webhook events.
@@ -159,54 +162,71 @@ func (s *Service) handlePostEvent(ctx context.Context, eventName string, body []
 	writeOK(w, "post event recorded, no reward triggered")
 }
 
-// payOnce: looks up reward_config, dedups via reward_events, signs an admin
-// transfer to discourse_id, applies it, and records the event.
+// payOnce: looks up reward_config, atomically reserves the reward event, signs
+// an admin transfer to discourse_id, applies it, and completes the dedup row.
 func (s *Service) payOnce(ctx context.Context, eventType, eventKey string, toDscID int64, toUsername string, w http.ResponseWriter) {
-	if toDscID <= ledger.TreasuryDscID {
-		writeOK(w, "skip non-user discourse_id")
-		return
-	}
-	amount, enabled, err := s.Rewards.GetRewardAmount(ctx, eventType)
-	if err != nil {
-		http.Error(w, "reward_config: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	if !enabled || amount <= 0 {
-		writeOK(w, "reward disabled or amount=0")
-		return
-	}
-	if toDscID == ledger.TreasuryDscID {
-		writeOK(w, "skip self-pay to treasury")
-		return
-	}
-	already, err := s.Rewards.RewardEventExists(ctx, eventType, eventKey)
-	if err != nil {
-		http.Error(w, "dedup check: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	if already {
-		writeOK(w, "already paid (dedup)")
-		return
-	}
-
-	tx, err := s.signAndApplyTransfer(ctx, toDscID, toUsername, amount, eventType)
+	result, err := s.PayRewardOnce(ctx, eventType, eventKey, toDscID, toUsername, eventType)
 	if err != nil {
 		http.Error(w, "apply: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	if err := s.Rewards.RecordRewardEvent(ctx, eventType, eventKey, tx.TxHash); err != nil {
-		// Reward paid but dedup row failed — log loudly, allow webhook to succeed.
-		log.Printf("rewards: WARN payOnce dedup-record failed (tx already applied): %v", err)
+	if !result.Paid {
+		writeOK(w, result.Reason)
+		return
 	}
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"status":     "paid",
 		"event":      eventType,
 		"to":         toDscID,
-		"amount":     amount,
-		"tx_hash":    hex.EncodeToString(tx.TxHash),
-		"leaf_index": tx.LeafIndex,
+		"amount":     result.Amount,
+		"tx_hash":    hex.EncodeToString(result.Tx.TxHash),
+		"leaf_index": result.Tx.LeafIndex,
 	})
+}
+
+type PaymentResult struct {
+	Paid   bool
+	Reason string
+	Amount int64
+	Tx     *ledger.Tx
+}
+
+// PayRewardOnce is the concurrency-safe reward primitive shared by webhooks
+// and admin backfills.
+func (s *Service) PayRewardOnce(ctx context.Context, eventType, eventKey string, toDscID int64, toUsername string, source string) (*PaymentResult, error) {
+	if toDscID <= ledger.TreasuryDscID {
+		return &PaymentResult{Reason: "skip non-user discourse_id"}, nil
+	}
+	amount, enabled, err := s.Rewards.GetRewardAmount(ctx, eventType)
+	if err != nil {
+		return nil, fmt.Errorf("reward_config: %w", err)
+	}
+	if !enabled || amount <= 0 {
+		return &PaymentResult{Reason: "reward disabled or amount=0"}, nil
+	}
+	if toDscID == ledger.TreasuryDscID {
+		return &PaymentResult{Reason: "skip self-pay to treasury"}, nil
+	}
+	reserved, err := s.Rewards.TryReserveRewardEvent(ctx, eventType, eventKey)
+	if err != nil {
+		return nil, fmt.Errorf("dedup reserve: %w", err)
+	}
+	if !reserved {
+		return &PaymentResult{Reason: "already paid or in-flight (dedup)"}, nil
+	}
+
+	tx, err := s.signAndApplyTransfer(ctx, toDscID, toUsername, amount, source)
+	if err != nil {
+		if releaseErr := s.Rewards.ReleaseRewardEvent(ctx, eventType, eventKey); releaseErr != nil {
+			log.Printf("rewards: WARN release reservation failed for %s/%s: %v", eventType, eventKey, releaseErr)
+		}
+		return nil, fmt.Errorf("apply: %w", err)
+	}
+	if err := s.Rewards.CompleteRewardEvent(ctx, eventType, eventKey, tx.TxHash); err != nil {
+		return nil, fmt.Errorf("dedup complete after tx %s: %w", hex.EncodeToString(tx.TxHash), err)
+	}
+	return &PaymentResult{Paid: true, Amount: amount, Tx: tx}, nil
 }
 
 // SignAndApplyTransfer is exported so the backfill CLI can call it.
@@ -218,6 +238,24 @@ func (s *Service) signAndApplyTransfer(ctx context.Context, toDscID int64, toUse
 	if toDscID <= ledger.TreasuryDscID {
 		return nil, ledger.ErrBadDiscourseID
 	}
+	s.adminSignMu.Lock()
+	defer s.adminSignMu.Unlock()
+
+	var lastNonceErr error
+	for attempt := 0; attempt < 8; attempt++ {
+		tx, err := s.signAndApplyTransferOnce(ctx, toDscID, toUsername, amount, source)
+		if err == nil {
+			return tx, nil
+		}
+		if !errors.Is(err, ledger.ErrBadNonce) {
+			return nil, err
+		}
+		lastNonceErr = err
+	}
+	return nil, lastNonceErr
+}
+
+func (s *Service) signAndApplyTransferOnce(ctx context.Context, toDscID int64, toUsername string, amount int64, source string) (*ledger.Tx, error) {
 	// Look up the admin's current nonce
 	stx, err := s.Store.Begin(ctx)
 	if err != nil {

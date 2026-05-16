@@ -18,6 +18,8 @@ Record:
 
 - `ADMIN_PUBKEY_HEX` - public key, safe to put in `.env`
 - `ADMIN_PRIV_KEY_HEX` - private key, keep offline when possible
+- `REWARD_PRIV_KEY_HEX` - optional hot key for automatic rewards
+- `STH_PRIV_KEY_HEX` - optional hot key for signed tree heads and OTS anchoring
 
 On the Discourse host:
 
@@ -35,9 +37,15 @@ PG_PASSWORD=<random 24+ char value>
 FORUM_BASE_URL=https://forum.example.com
 ADMIN_PUBKEY_HEX=<from keygen>
 ADMIN_PRIV_KEY_HEX=<from keygen, required for genesis and auto rewards>
+REWARD_PRIV_KEY_HEX=<prefer a separate reward hot key in production>
+STH_PRIV_KEY_HEX=<prefer a separate STH hot key in production>
 ADMIN_SESSION_SECRET=<openssl rand -hex 32>
 DISCOURSE_CONNECT_SECRET=<openssl rand -hex 32>
 DISCOURSE_WEBHOOK_SECRET=<openssl rand -hex 32>
+OTS_CALENDAR_URL=https://a.pool.opentimestamps.org/digest
+OTS_CALENDAR_ALLOWLIST=
+WALLET_RATE_LIMIT_PER_MINUTE=600
+WALLET_RATE_LIMIT_BURST=120
 TREASURY_USERNAME=TREASURY
 ```
 
@@ -79,6 +87,8 @@ hooks:
             proxy_set_header X-Real-IP $remote_addr;
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
             proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
           }
 ```
 
@@ -147,6 +157,8 @@ tar -czf /tmp/forum-points-theme.tar.gz about.json README.md common javascripts 
 - Open a user card and confirm the balance badge appears.
 - Tip another user's post.
 - Confirm `/wallet/explorer/account/<id>` shows the transaction.
+- In `/wallet/admin/`, open Audit and use "Anchor with OTS"; or run
+  `docker compose exec sidecar ledger-admin anchor-sth`.
 
 ## 8. Optional Witness
 

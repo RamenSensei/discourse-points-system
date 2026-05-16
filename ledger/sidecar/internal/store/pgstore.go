@@ -15,6 +15,8 @@ import (
 	"github.com/forum-points/ledger/internal/ledger"
 )
 
+const ledgerAdvisoryLockKey int64 = 0x46504c4544474552 // "FPLEDGER"
+
 //go:embed migrations/*.sql
 var migrationsFS embed.FS
 
@@ -98,7 +100,7 @@ func isMigrationFile(e fs.DirEntry) bool {
 }
 
 func (s *PGStore) Begin(ctx context.Context) (ledger.StoreTx, error) {
-	pgtx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+	pgtx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return nil, err
 	}
@@ -121,6 +123,11 @@ func (t *pgStoreTx) Rollback(ctx context.Context) error {
 	}
 	t.done = true
 	return t.pgtx.Rollback(ctx)
+}
+
+func (t *pgStoreTx) LockLedger(ctx context.Context) error {
+	_, err := t.pgtx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, ledgerAdvisoryLockKey)
+	return err
 }
 
 func (t *pgStoreTx) GetAccountByPubKey(ctx context.Context, pubkey []byte) (*ledger.Account, error) {
@@ -154,6 +161,30 @@ func (t *pgStoreTx) GetAccountByDiscourseID(ctx context.Context, did int64) (*le
 		return nil, err
 	}
 	return &a, nil
+}
+
+func (t *pgStoreTx) GetAccountsByDiscourseIDs(ctx context.Context, dids []int64) (map[int64]*ledger.Account, error) {
+	out := make(map[int64]*ledger.Account, len(dids))
+	if len(dids) == 0 {
+		return out, nil
+	}
+	rows, err := t.pgtx.Query(ctx,
+		`SELECT discourse_id, pubkey, username, nonce, balance
+		   FROM accounts
+		  WHERE discourse_id = ANY($1)`, dids,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var a ledger.Account
+		if err := rows.Scan(&a.DiscourseID, &a.Pubkey, &a.Username, &a.Nonce, &a.Balance); err != nil {
+			return nil, err
+		}
+		out[a.DiscourseID] = &a
+	}
+	return out, rows.Err()
 }
 
 func (t *pgStoreTx) UpsertAccount(ctx context.Context, a *ledger.Account) error {
@@ -227,11 +258,24 @@ func (t *pgStoreTx) LastTx(ctx context.Context) (*ledger.Tx, error) {
 }
 
 func (t *pgStoreTx) InsertTx(ctx context.Context, tx *ledger.Tx) error {
-	_, err := t.pgtx.Exec(ctx,
+	fields, err := ledger.DeriveTxFields(tx.Type, tx.Payload)
+	if err != nil {
+		return err
+	}
+	var amountArg, toArg any
+	if fields.Amount != nil {
+		amountArg = *fields.Amount
+	}
+	if fields.ToDiscourseID != nil {
+		toArg = *fields.ToDiscourseID
+	}
+	_, err = t.pgtx.Exec(ctx,
 		`INSERT INTO transactions
-		   (leaf_index, tx_type, payload, sig, signer, prev_hash, tx_hash)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+		   (leaf_index, tx_type, payload, sig, signer, prev_hash, tx_hash,
+		    amount, to_discourse_id, reward_source)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULLIF($10, ''))`,
 		tx.LeafIndex, string(tx.Type), []byte(tx.Payload), tx.Sig, tx.Signer, tx.PrevHash, tx.TxHash,
+		amountArg, toArg, fields.RewardSource,
 	)
 	return err
 }
@@ -254,7 +298,8 @@ func (t *pgStoreTx) TotalBalance(ctx context.Context) (int64, error) {
 
 // --- reward dedup + config helpers (used by webhook handler, not by ledger.Apply) ---
 
-// RewardEventExists returns true if a reward of (event_type, event_key) has already paid.
+// RewardEventExists returns true if a reward of (event_type, event_key) has
+// already paid or is currently reserved by another worker.
 func (s *PGStore) RewardEventExists(ctx context.Context, eventType, eventKey string) (bool, error) {
 	var exists bool
 	err := s.pool.QueryRow(ctx,
@@ -264,16 +309,70 @@ func (s *PGStore) RewardEventExists(ctx context.Context, eventType, eventKey str
 	return exists, err
 }
 
+// TryReserveRewardEvent atomically claims a reward event before the ledger
+// transfer is signed. This prevents duplicate payouts when webhooks or backfills
+// race on the same event key.
+func (s *PGStore) TryReserveRewardEvent(ctx context.Context, eventType, eventKey string) (bool, error) {
+	_, err := s.pool.Exec(ctx,
+		`DELETE FROM reward_events
+		  WHERE event_type = $1
+		    AND event_key = $2
+		    AND tx_hash IS NULL
+		    AND paid_at < now() - interval '15 minutes'`,
+		eventType, eventKey,
+	)
+	if err != nil {
+		return false, err
+	}
+
+	var reserved bool
+	err = s.pool.QueryRow(ctx,
+		`INSERT INTO reward_events (event_type, event_key)
+		 VALUES ($1, $2)
+		 ON CONFLICT (event_type, event_key) DO NOTHING
+		 RETURNING true`,
+		eventType, eventKey,
+	).Scan(&reserved)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	return reserved, err
+}
+
+func (s *PGStore) CompleteRewardEvent(ctx context.Context, eventType, eventKey string, txHash []byte) error {
+	tag, err := s.pool.Exec(ctx,
+		`INSERT INTO reward_events (event_type, event_key, tx_hash)
+		 VALUES ($1, $2, $3)
+		 ON CONFLICT (event_type, event_key) DO UPDATE SET
+		   tx_hash = COALESCE(reward_events.tx_hash, EXCLUDED.tx_hash),
+		   paid_at = CASE WHEN reward_events.tx_hash IS NULL THEN now() ELSE reward_events.paid_at END
+		 WHERE reward_events.tx_hash IS NULL OR reward_events.tx_hash = EXCLUDED.tx_hash`,
+		eventType, eventKey, txHash,
+	)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return errors.New("reward event already completed with a different tx_hash")
+	}
+	return nil
+}
+
+func (s *PGStore) ReleaseRewardEvent(ctx context.Context, eventType, eventKey string) error {
+	_, err := s.pool.Exec(ctx,
+		`DELETE FROM reward_events
+		  WHERE event_type = $1
+		    AND event_key = $2
+		    AND tx_hash IS NULL`,
+		eventType, eventKey,
+	)
+	return err
+}
+
 // RecordRewardEvent links the given tx_hash to a (event_type, event_key) dedup row.
 // Must be called AFTER Apply succeeded (so tx_hash exists in transactions).
 func (s *PGStore) RecordRewardEvent(ctx context.Context, eventType, eventKey string, txHash []byte) error {
-	_, err := s.pool.Exec(ctx,
-		`INSERT INTO reward_events (event_type, event_key, tx_hash)
-		 VALUES ($1, $2, $3)
-		 ON CONFLICT (event_type, event_key) DO NOTHING`,
-		eventType, eventKey, txHash,
-	)
-	return err
+	return s.CompleteRewardEvent(ctx, eventType, eventKey, txHash)
 }
 
 func (s *PGStore) GetRewardAmount(ctx context.Context, eventType string) (int64, bool, error) {
@@ -307,15 +406,15 @@ type HistoryRow struct {
 }
 
 // UserHistory returns transactions where the user is sender (signer pubkey ==
-// accounts.pubkey for this discourse_id) or receiver (payload.to_discourse_id == id).
-// Uses an on-the-fly JSON parse over the BYTEA payload — fine at our scale.
+// accounts.pubkey for this discourse_id) or receiver (to_discourse_id == id).
+// Hot fields are denormalized from the signed payload by migration 0005.
 func (s *PGStore) UserHistory(ctx context.Context, discourseID int64, limit int) ([]HistoryRow, error) {
 	rows, err := s.pool.Query(ctx, `
 WITH me AS (SELECT pubkey FROM accounts WHERE discourse_id = $1)
 SELECT t.leaf_index,
        t.tx_type,
-       COALESCE((convert_from(t.payload, 'UTF8')::jsonb ->> 'amount')::bigint, 0)            AS amount,
-       COALESCE((convert_from(t.payload, 'UTF8')::jsonb ->> 'to_discourse_id')::bigint, -1)  AS to_did,
+       COALESCE(t.amount, 0)                                                                 AS amount,
+       COALESCE(t.to_discourse_id, -1)                                                       AS to_did,
        encode(t.signer, 'hex')                                                                AS signer_hex,
        encode(t.tx_hash, 'hex')                                                               AS tx_hash_hex,
        (convert_from(t.payload, 'UTF8')::jsonb -> 'meta')                                     AS meta,
@@ -325,11 +424,11 @@ SELECT t.leaf_index,
        COALESCE(a_from.username, '')                                                          AS from_name
   FROM transactions t
   LEFT JOIN accounts a_from ON a_from.pubkey = t.signer
-  LEFT JOIN accounts a_to   ON a_to.discourse_id = COALESCE((convert_from(t.payload, 'UTF8')::jsonb ->> 'to_discourse_id')::bigint, -1)
+  LEFT JOIN accounts a_to   ON a_to.discourse_id = t.to_discourse_id
  WHERE t.tx_type IN ('transfer', 'rotate_key')
    AND (
         t.signer = (SELECT pubkey FROM me)
-     OR COALESCE((convert_from(t.payload, 'UTF8')::jsonb ->> 'to_discourse_id')::bigint, -1) = $1
+     OR t.to_discourse_id = $1
        )
  ORDER BY t.leaf_index DESC
  LIMIT $2`,

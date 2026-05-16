@@ -10,10 +10,11 @@
 package txlog
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
-	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -49,26 +50,24 @@ type Service struct {
 	Pool         *pgxpool.Pool
 	AdminPrivKey ed25519.PrivateKey
 	AdminPubKey  ed25519.PublicKey
+	mu           sync.Mutex
+	snapshot     *merkleSnapshot
+}
+
+type merkleSnapshot struct {
+	TreeSize   int64
+	TxHashes   [][]byte
+	LeafHashes [][]byte
+	RootHash   []byte
 }
 
 // AllTxHashes returns all tx_hash bytes in leaf_index order.
 func (s *Service) AllTxHashes(ctx context.Context) ([][]byte, error) {
-	rows, err := s.Pool.Query(ctx,
-		`SELECT tx_hash FROM transactions ORDER BY leaf_index ASC`,
-	)
+	snap, err := s.merkleSnapshot(ctx, -1)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var out [][]byte
-	for rows.Next() {
-		var h []byte
-		if err := rows.Scan(&h); err != nil {
-			return nil, err
-		}
-		out = append(out, h)
-	}
-	return out, rows.Err()
+	return snap.TxHashes, nil
 }
 
 // RangeLeaves returns full leaf records for [from, to). Use -1 for "no limit".
@@ -103,38 +102,155 @@ func (s *Service) RangeLeaves(ctx context.Context, from, to int64) ([]LeafRecord
 
 // CurrentSTH computes the root of the current tree and signs it.
 func (s *Service) CurrentSTH(ctx context.Context) (*STH, error) {
-	hashes, err := s.AllTxHashes(ctx)
+	snap, err := s.merkleSnapshot(ctx, -1)
 	if err != nil {
 		return nil, err
 	}
-	leafHashes := make([][]byte, len(hashes))
-	for i, h := range hashes {
-		leafHashes[i] = merkle.LeafHash(h)
+	return s.persistCheckpoint(ctx, snap.TreeSize, snap.RootHash)
+}
+
+func (s *Service) CurrentTreeSize(ctx context.Context) (int64, error) {
+	var size int64
+	err := s.Pool.QueryRow(ctx,
+		`SELECT COALESCE(MAX(leaf_index) + 1, 0) FROM transactions`,
+	).Scan(&size)
+	return size, err
+}
+
+func (s *Service) LeafHashes(ctx context.Context, treeSize int64) ([][]byte, error) {
+	snap, err := s.merkleSnapshot(ctx, treeSize)
+	if err != nil {
+		return nil, err
 	}
-	root := merkle.RootFromLeafHashes(leafHashes)
+	return snap.LeafHashes, nil
+}
+
+func (s *Service) merkleSnapshot(ctx context.Context, treeSize int64) (*merkleSnapshot, error) {
+	target := treeSize
+	if target < 0 {
+		var err error
+		target, err = s.CurrentTreeSize(ctx)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if target < 0 {
+		return nil, fmt.Errorf("bad tree size %d", target)
+	}
+
+	s.mu.Lock()
+	cached := s.snapshot
+	if cached != nil && target <= cached.TreeSize {
+		out := &merkleSnapshot{
+			TreeSize:   target,
+			TxHashes:   cached.TxHashes[:target],
+			LeafHashes: cached.LeafHashes[:target],
+			RootHash:   merkle.RootFromLeafHashes(cached.LeafHashes[:target]),
+		}
+		s.mu.Unlock()
+		return out, nil
+	}
+
+	start := int64(0)
+	var txHashes [][]byte
+	var leafHashes [][]byte
+	if cached != nil {
+		start = cached.TreeSize
+		txHashes = append(txHashes, cached.TxHashes...)
+		leafHashes = append(leafHashes, cached.LeafHashes...)
+	}
+	s.mu.Unlock()
+
+	if start < target {
+		rows, err := s.Pool.Query(ctx,
+			`SELECT leaf_index, tx_hash
+			   FROM transactions
+			  WHERE leaf_index >= $1 AND leaf_index < $2
+			  ORDER BY leaf_index ASC`,
+			start, target,
+		)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		next := start
+		for rows.Next() {
+			var idx int64
+			var h []byte
+			if err := rows.Scan(&idx, &h); err != nil {
+				return nil, err
+			}
+			if idx != next {
+				return nil, fmt.Errorf("transaction log gap at leaf_index=%d, got %d", next, idx)
+			}
+			txHashes = append(txHashes, h)
+			leafHashes = append(leafHashes, merkle.LeafHash(h))
+			next++
+		}
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+		if next != target {
+			return nil, fmt.Errorf("transaction log ended at %d, want tree_size=%d", next, target)
+		}
+	}
+
+	snap := &merkleSnapshot{
+		TreeSize:   target,
+		TxHashes:   txHashes,
+		LeafHashes: leafHashes,
+		RootHash:   merkle.RootFromLeafHashes(leafHashes),
+	}
+	s.mu.Lock()
+	if s.snapshot == nil || snap.TreeSize >= s.snapshot.TreeSize {
+		s.snapshot = snap
+	}
+	s.mu.Unlock()
+	return snap, nil
+}
+
+func (s *Service) persistCheckpoint(ctx context.Context, treeSize int64, root []byte) (*STH, error) {
 	ts := time.Now().UnixMilli()
+	sig := ed25519.Sign(s.AdminPrivKey, signedSTHBytes(treeSize, root, ts))
 
-	// Sign canonical bytes "fp.sth.v1|<tree_size>|<root_hex>|<ts_ms>"
-	msg := signedSTHBytes(int64(len(hashes)), root, ts)
-	sig := ed25519.Sign(s.AdminPrivKey, msg)
+	var storedRoot, storedSig, storedPub []byte
+	var storedTS int64
+	err := s.Pool.QueryRow(ctx,
+		`INSERT INTO checkpoints (tree_size, root_hash, timestamp_ms, admin_sig, admin_pubkey)
+		 VALUES ($1, $2, $3, $4, $5)
+		 ON CONFLICT (tree_size) DO NOTHING
+		 RETURNING root_hash, timestamp_ms, admin_sig, admin_pubkey`,
+		treeSize, root, ts, sig, []byte(s.AdminPubKey),
+	).Scan(&storedRoot, &storedTS, &storedSig, &storedPub)
+	if err != nil {
+		if err != pgx.ErrNoRows {
+			return nil, fmt.Errorf("persist checkpoint: %w", err)
+		}
+		err = s.Pool.QueryRow(ctx,
+			`SELECT root_hash, timestamp_ms, admin_sig, admin_pubkey
+			   FROM checkpoints
+			  WHERE tree_size = $1`,
+			treeSize,
+		).Scan(&storedRoot, &storedTS, &storedSig, &storedPub)
+		if err != nil {
+			return nil, fmt.Errorf("load checkpoint: %w", err)
+		}
+	}
 
-	// Also persist this STH to checkpoints (idempotent on tree_size).
-	_, err = s.Pool.Exec(ctx,
-		`INSERT INTO checkpoints (tree_size, root_hash, timestamp_ms, admin_sig)
-		 VALUES ($1, $2, $3, $4)
-		 ON CONFLICT (tree_size) DO NOTHING`,
-		int64(len(hashes)), root, ts, sig,
-	)
-	if err != nil && !isUniqueViolation(err) {
-		return nil, fmt.Errorf("persist checkpoint: %w", err)
+	if !bytes.Equal(storedRoot, root) {
+		return nil, fmt.Errorf("checkpoint tree_size=%d has root %s, current root is %s", treeSize, hex(storedRoot), hex(root))
+	}
+	storedPub, err = s.checkpointPubKey(ctx, treeSize, storedRoot, storedTS, storedSig, storedPub)
+	if err != nil {
+		return nil, err
 	}
 
 	return &STH{
-		TreeSize:    int64(len(hashes)),
-		RootHash:    hex(root),
-		TimestampMS: ts,
-		AdminSig:    hex(sig),
-		AdminPubKey: hex([]byte(s.AdminPubKey)),
+		TreeSize:    treeSize,
+		RootHash:    hex(storedRoot),
+		TimestampMS: storedTS,
+		AdminSig:    hex(storedSig),
+		AdminPubKey: hex(storedPub),
 	}, nil
 }
 
@@ -146,6 +262,7 @@ type CheckpointSummary struct {
 	RootHash      string `json:"root_hash_hex"`
 	TimestampMS   int64  `json:"timestamp_ms"`
 	AdminSig      string `json:"admin_sig_hex"`
+	AdminPubKey   string `json:"admin_pubkey_hex"`
 	HasOTSReceipt bool   `json:"has_ots_receipt"`
 }
 
@@ -156,7 +273,7 @@ func (s *Service) Checkpoints(ctx context.Context, limit int) ([]CheckpointSumma
 		limit = 50
 	}
 	rows, err := s.Pool.Query(ctx,
-		`SELECT tree_size, root_hash, timestamp_ms, admin_sig, ots_receipt IS NOT NULL
+		`SELECT tree_size, root_hash, timestamp_ms, admin_sig, admin_pubkey, ots_receipt IS NOT NULL
 		   FROM checkpoints
 		  ORDER BY tree_size DESC
 		  LIMIT $1`, limit,
@@ -168,21 +285,49 @@ func (s *Service) Checkpoints(ctx context.Context, limit int) ([]CheckpointSumma
 	var out []CheckpointSummary
 	for rows.Next() {
 		var size int64
-		var root, sig []byte
+		var root, sig, pub []byte
 		var ts int64
 		var hasOTS bool
-		if err := rows.Scan(&size, &root, &ts, &sig, &hasOTS); err != nil {
+		if err := rows.Scan(&size, &root, &ts, &sig, &pub, &hasOTS); err != nil {
 			return nil, err
+		}
+		if len(pub) == 0 {
+			pub, err = s.checkpointPubKey(ctx, size, root, ts, sig, pub)
+			if err != nil {
+				return nil, err
+			}
 		}
 		out = append(out, CheckpointSummary{
 			TreeSize:      size,
 			RootHash:      hex(root),
 			TimestampMS:   ts,
 			AdminSig:      hex(sig),
+			AdminPubKey:   hex(pub),
 			HasOTSReceipt: hasOTS,
 		})
 	}
 	return out, rows.Err()
+}
+
+func (s *Service) checkpointPubKey(ctx context.Context, treeSize int64, root []byte, tsMS int64, sig, storedPub []byte) ([]byte, error) {
+	if len(storedPub) > 0 {
+		return storedPub, nil
+	}
+	currentPub := []byte(s.AdminPubKey)
+	if !ed25519.Verify(s.AdminPubKey, signedSTHBytes(treeSize, root, tsMS), sig) {
+		return nil, fmt.Errorf("checkpoint tree_size=%d has no stored admin_pubkey and does not verify with current admin key", treeSize)
+	}
+	_, err := s.Pool.Exec(ctx,
+		`UPDATE checkpoints
+		    SET admin_pubkey = $2
+		  WHERE tree_size = $1
+		    AND admin_pubkey IS NULL`,
+		treeSize, currentPub,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("backfill checkpoint admin pubkey: %w", err)
+	}
+	return currentPub, nil
 }
 
 // SignedSTHBytes is exported so the verify CLI can replay the signed message.
@@ -194,19 +339,6 @@ func signedSTHBytes(treeSize int64, rootHash []byte, tsMS int64) []byte {
 	return []byte(fmt.Sprintf("fp.sth.v1|%d|%s|%d", treeSize, hex(rootHash), tsMS))
 }
 
-func isUniqueViolation(err error) bool {
-	var pgErr *pgErrorLite
-	if !errorAs(err, &pgErr) {
-		return false
-	}
-	return false
-}
-
-// minimal placeholders so we don't import pgconn directly here
-type pgErrorLite struct{}
-
-func errorAs(err error, _ **pgErrorLite) bool { return false }
-
 func hex(b []byte) string {
 	const hexdigits = "0123456789abcdef"
 	out := make([]byte, len(b)*2)
@@ -216,7 +348,3 @@ func hex(b []byte) string {
 	}
 	return string(out)
 }
-
-// silence unused import warnings during gradual fills
-var _ = pgx.ErrNoRows
-var _ = json.Marshal

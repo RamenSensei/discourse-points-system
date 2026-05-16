@@ -13,6 +13,8 @@ location, normally `/wallet/`.
 - Optional Discourse webhooks for automatic rewards.
 - Admin web UI with Ed25519 challenge-response login.
 - Optional OpenTimestamps anchoring and witness process.
+- High-concurrency writes use a Postgres advisory ledger lock, so the
+  prev-hash chain is serialized without retry storms.
 
 ## Quick Start
 
@@ -24,6 +26,8 @@ docker compose run --rm --entrypoint ledger-admin sidecar keygen
 Paste the generated `ADMIN_PUBKEY_HEX` into `.env`. Store
 `ADMIN_PRIV_KEY_HEX` in a password manager; set it in `.env` only when you need
 genesis, automatic rewards, STH signing, or admin CLI actions.
+For production, prefer `REWARD_PRIV_KEY_HEX` and `STH_PRIV_KEY_HEX` so reward
+signing and STH signing do not require the treasury key to stay online.
 
 ```bash
 docker compose up -d --build
@@ -60,6 +64,8 @@ hooks:
             proxy_set_header X-Real-IP $remote_addr;
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
             proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
           }
 ```
 
@@ -98,6 +104,7 @@ When mounted at `/wallet/`, these become visible under
 |---|---|---|
 | `GET /api/v1/health` | none | liveness |
 | `GET /api/v1/balance/{id}` | none | public account balance |
+| `POST /api/v1/balances` | none | batch public balances |
 | `GET /api/v1/history/{id}` | none | public account history |
 | `GET /api/v1/treasury` | none | supply and treasury status |
 | `GET /api/v1/me` | wallet session | current user's account |
@@ -115,13 +122,21 @@ make test
 make build
 docker compose logs -f sidecar
 docker compose exec postgres pg_dump -U ledger ledger > backup.sql
+docker compose exec sidecar ledger-admin anchor-sth
 cd sidecar && go run ./cmd/ledger-verify -target https://forum.example.com/wallet -samples 100
 ```
+
+`anchor-sth` submits only the SHA-256 digest of the signed tree head to the
+configured OpenTimestamps calendar (`OTS_CALENDAR_URL`, default public pool) and
+stores the returned receipt in `checkpoints.ots_receipt`.
 
 ## Security Notes
 
 - Do not commit `.env`, `.admin-key`, database dumps, or generated private keys.
 - Leave `WALLET_ALLOW_HEADER_AUTH` empty in production.
-- Keep `ADMIN_PRIV_KEY_HEX` offline where possible.
+- Keep `ADMIN_PRIV_KEY_HEX` offline where possible; use `REWARD_PRIV_KEY_HEX`
+  and `STH_PRIV_KEY_HEX` for online duties.
+- Admin write APIs require a session-derived CSRF token and same-origin browser
+  writes. OTS calendar URLs are restricted to the configured allowlist.
 - Run a witness on another host if split-view resistance matters.
 - Public balance and history endpoints are intentionally public.

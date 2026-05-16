@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -86,7 +88,12 @@ func main() {
 	}
 	log.Println("migrations OK")
 
-	srv := &api.Server{Store: pg, History: &pgHistoryAdapter{pg: pg}}
+	srv := &api.Server{
+		Store:              pg,
+		History:            &pgHistoryAdapter{pg: pg},
+		RateLimitPerMinute: envInt("WALLET_RATE_LIMIT_PER_MINUTE"),
+		RateLimitBurst:     envInt("WALLET_RATE_LIMIT_BURST"),
+	}
 	if os.Getenv("WALLET_ALLOW_HEADER_AUTH") == "1" {
 		tok := os.Getenv("WALLET_DEV_HEADER_AUTH_TOKEN")
 		if len(tok) < 32 {
@@ -117,19 +124,18 @@ func main() {
 	}
 
 	if wbSecret := os.Getenv("DISCOURSE_WEBHOOK_SECRET"); wbSecret != "" {
-		privHex := os.Getenv("ADMIN_PRIV_KEY_HEX")
-		if privHex == "" {
-			log.Fatal("ADMIN_PRIV_KEY_HEX required when DISCOURSE_WEBHOOK_SECRET is set (sidecar must sign reward txs)")
+		priv, ok, err := privateKeyFromEnv("REWARD_PRIV_KEY_HEX", "ADMIN_PRIV_KEY_HEX")
+		if err != nil {
+			log.Fatal(err)
 		}
-		priv, err := hex.DecodeString(privHex)
-		if err != nil || len(priv) != ed25519.PrivateKeySize {
-			log.Fatal("ADMIN_PRIV_KEY_HEX must be a 128-char hex Ed25519 private key")
+		if !ok {
+			log.Fatal("REWARD_PRIV_KEY_HEX required when DISCOURSE_WEBHOOK_SECRET is set (legacy fallback: ADMIN_PRIV_KEY_HEX)")
 		}
-		pub := ed25519.PrivateKey(priv).Public().(ed25519.PublicKey)
+		pub := priv.Public().(ed25519.PublicKey)
 		srv.Rewards = &rewards.Service{
 			Store:         pg,
 			Rewards:       pg, // PGStore implements rewards.Rewards
-			AdminPrivKey:  ed25519.PrivateKey(priv),
+			AdminPrivKey:  priv,
 			AdminPubKey:   pub,
 			WebhookSecret: []byte(wbSecret),
 		}
@@ -138,19 +144,18 @@ func main() {
 		log.Println("Discourse webhook handler disabled (set DISCOURSE_WEBHOOK_SECRET to enable)")
 	}
 
-	// Tx log + STH service is enabled whenever ADMIN_PRIV_KEY_HEX is present
-	// (it's a read-only audit surface — STH signing reuses the admin key).
-	if privHex := os.Getenv("ADMIN_PRIV_KEY_HEX"); privHex != "" {
-		priv, err := hex.DecodeString(privHex)
-		if err == nil && len(priv) == ed25519.PrivateKeySize {
-			pub := ed25519.PrivateKey(priv).Public().(ed25519.PublicKey)
-			srv.TxLog = &txlog.Service{
-				Pool:         pg.Pool(),
-				AdminPrivKey: ed25519.PrivateKey(priv),
-				AdminPubKey:  pub,
-			}
-			log.Println("Tx log + STH endpoints enabled (/log/sth, /log/leaves, /log/inclusion, /log/consistency)")
+	// Tx log + STH service is enabled when a STH signing key is present.
+	// ADMIN_PRIV_KEY_HEX remains as a legacy fallback for single-key installs.
+	if priv, ok, err := privateKeyFromEnv("STH_PRIV_KEY_HEX", "ADMIN_PRIV_KEY_HEX"); err != nil {
+		log.Fatal(err)
+	} else if ok {
+		pub := priv.Public().(ed25519.PublicKey)
+		srv.TxLog = &txlog.Service{
+			Pool:         pg.Pool(),
+			AdminPrivKey: priv,
+			AdminPubKey:  pub,
 		}
+		log.Println("Tx log + STH endpoints enabled (/log/sth, /log/leaves, /log/inclusion, /log/consistency)")
 	}
 
 	// Admin Web UI — enabled whenever ADMIN_PUBKEY_HEX is configured.
@@ -166,11 +171,13 @@ func main() {
 				log.Println("ADMIN_SESSION_SECRET not set; using ephemeral (admin sessions lost on restart)")
 			}
 			srv.Admin = &admin.Service{
-				AdminPubKey:   ed25519.PublicKey(pub),
-				SessionSecret: sessSecret,
-				Pool:          pg.Pool(),
-				TxLog:         srv.TxLog,
-				SecureCookies: os.Getenv("WALLET_INSECURE_COOKIES") != "1",
+				AdminPubKey:          ed25519.PublicKey(pub),
+				SessionSecret:        sessSecret,
+				Pool:                 pg.Pool(),
+				TxLog:                srv.TxLog,
+				SecureCookies:        os.Getenv("WALLET_INSECURE_COOKIES") != "1",
+				OTSCalendarURL:       os.Getenv("OTS_CALENDAR_URL"),
+				OTSCalendarAllowlist: splitCSVEnv("OTS_CALENDAR_ALLOWLIST"),
 			}
 			log.Println("Admin Web UI enabled at /wallet/admin/ (challenge-sign login with admin Ed25519 key)")
 		}
@@ -196,4 +203,49 @@ func main() {
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 	_ = httpSrv.Shutdown(shutdownCtx)
+}
+
+func privateKeyFromEnv(primary, fallback string) (ed25519.PrivateKey, bool, error) {
+	value := os.Getenv(primary)
+	name := primary
+	if value == "" && fallback != "" {
+		value = os.Getenv(fallback)
+		name = fallback
+	}
+	if value == "" {
+		return nil, false, nil
+	}
+	raw, err := hex.DecodeString(value)
+	if err != nil || len(raw) != ed25519.PrivateKeySize {
+		return nil, false, errors.New(name + " must be a 128-char hex Ed25519 private key")
+	}
+	return ed25519.PrivateKey(raw), true, nil
+}
+
+func envInt(name string) int {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 0 {
+		log.Fatalf("%s must be a non-negative integer", name)
+	}
+	return n
+}
+
+func splitCSVEnv(name string) []string {
+	raw := os.Getenv(name)
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
 }

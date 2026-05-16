@@ -77,6 +77,12 @@ type RewardConfigPayload struct {
 	Nonce     int64  `json:"nonce"`
 }
 
+type DerivedTxFields struct {
+	Amount        *int64
+	ToDiscourseID *int64
+	RewardSource  string
+}
+
 var (
 	ErrBadSig            = errors.New("invalid signature")
 	ErrBadPubKey         = errors.New("bad pubkey length")
@@ -144,4 +150,30 @@ func SignPayload(priv ed25519.PrivateKey, payload []byte) []byte {
 
 func ZeroHash() []byte {
 	return make([]byte, HashLen)
+}
+
+func DeriveTxFields(t TxType, payload []byte) (DerivedTxFields, error) {
+	var out DerivedTxFields
+	switch t {
+	case TxTransfer:
+		var p TransferPayload
+		if err := json.Unmarshal(payload, &p); err != nil {
+			return out, err
+		}
+		amount := p.Amount
+		to := p.ToDiscourseID
+		out.Amount = &amount
+		out.ToDiscourseID = &to
+		if v, ok := p.Meta["reward_source"].(string); ok {
+			out.RewardSource = v
+		}
+	case TxReclaimInvalid:
+		var p ReclaimInvalidPayload
+		if err := json.Unmarshal(payload, &p); err != nil {
+			return out, err
+		}
+		amount := p.Amount
+		out.Amount = &amount
+	}
+	return out, nil
 }

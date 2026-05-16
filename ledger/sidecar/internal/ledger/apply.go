@@ -14,10 +14,12 @@ type Store interface {
 type StoreTx interface {
 	Commit(ctx context.Context) error
 	Rollback(ctx context.Context) error
+	LockLedger(ctx context.Context) error
 
 	// Accounts — pubkey is optional; for unactivated accounts pubkey==nil.
 	GetAccountByPubKey(ctx context.Context, pubkey []byte) (*Account, error)
 	GetAccountByDiscourseID(ctx context.Context, discourseID int64) (*Account, error)
+	GetAccountsByDiscourseIDs(ctx context.Context, discourseIDs []int64) (map[int64]*Account, error)
 	UpsertAccount(ctx context.Context, a *Account) error
 	UpdatePubKey(ctx context.Context, oldPub, newPub []byte) error
 	UpdateUsernameAndPubKey(ctx context.Context, discourseID int64, pubkey []byte, username string) error
@@ -37,8 +39,9 @@ type Account struct {
 	Balance     int64
 }
 
-// Apply validates, sig-checks, and persists a Tx with the full supply-conservation
-// invariant. Caller provides a Store; Apply opens its own transaction.
+// Apply validates, sig-checks, and persists a Tx. Ledger writes are globally
+// ordered by StoreTx.LockLedger so prev_hash and leaf_index remain a single
+// append-only sequence under concurrent submitters.
 func Apply(ctx context.Context, s Store, tx *Tx) error {
 	if !VerifySig(tx.Signer, tx.Payload, tx.Sig) {
 		return ErrBadSig
@@ -49,6 +52,10 @@ func Apply(ctx context.Context, s Store, tx *Tx) error {
 		return fmt.Errorf("begin: %w", err)
 	}
 	defer func() { _ = stx.Rollback(ctx) }()
+
+	if err := stx.LockLedger(ctx); err != nil {
+		return fmt.Errorf("ledger lock: %w", err)
+	}
 
 	last, err := stx.LastTx(ctx)
 	if err != nil {
@@ -102,15 +109,21 @@ func Apply(ctx context.Context, s Store, tx *Tx) error {
 		return fmt.Errorf("insert tx: %w", err)
 	}
 
-	total, err := stx.TotalBalance(ctx)
-	if err != nil {
-		return fmt.Errorf("total balance: %w", err)
-	}
-	if total != SupplyCap {
-		return fmt.Errorf("%w: sum(balance)=%d cap=%d", ErrSupplyViolated, total, SupplyCap)
+	if requiresFullSupplyCheck(tx.Type) {
+		total, err := stx.TotalBalance(ctx)
+		if err != nil {
+			return fmt.Errorf("total balance: %w", err)
+		}
+		if total != SupplyCap {
+			return fmt.Errorf("%w: sum(balance)=%d cap=%d", ErrSupplyViolated, total, SupplyCap)
+		}
 	}
 
 	return stx.Commit(ctx)
+}
+
+func requiresFullSupplyCheck(t TxType) bool {
+	return t == TxGenesis || t == TxReclaimInvalid
 }
 
 func applyGenesis(ctx context.Context, stx StoreTx, tx *Tx) error {

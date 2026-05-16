@@ -22,7 +22,7 @@ import (
 )
 
 const (
-	defaultCalendar = "https://a.pool.opentimestamps.org/digest"
+	DefaultCalendar = "https://a.pool.opentimestamps.org/digest"
 	contentType     = "application/vnd.opentimestamps.v1"
 )
 
@@ -32,7 +32,7 @@ func Submit(ctx context.Context, calendarURL string, digest []byte) ([]byte, err
 		return nil, errors.New("digest must be 32 bytes")
 	}
 	if calendarURL == "" {
-		calendarURL = defaultCalendar
+		calendarURL = DefaultCalendar
 	}
 	req, err := http.NewRequestWithContext(ctx, "POST", calendarURL, bytes.NewReader(digest))
 	if err != nil {

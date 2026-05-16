@@ -176,13 +176,13 @@
         <div class="card">
           <h3>Digest awaiting anchor</h3>
           <p class="card__note">
-            Hash of the canonical signed tree head. Paste this 32-byte digest
-            into <code>ots stamp</code>, an RFC 3161 TSA, or any other
-            timestamping calendar.
+            Hash of the canonical signed tree head. Anchor it with
+            OpenTimestamps or copy it into another timestamping authority.
           </p>
           <pre id="audit-digest" class="mono">—</pre>
           <div class="actions">
             <button id="audit-refresh">Refresh digest</button>
+            <button id="audit-anchor">Anchor with OTS</button>
             <button id="audit-copy" class="ghost">Copy digest</button>
           </div>
         </div>

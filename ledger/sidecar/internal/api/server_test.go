@@ -202,6 +202,65 @@ func TestBalance_NegativeID_400(t *testing.T) {
 	}
 }
 
+func TestBalances_BatchIncludesKnownAndUnknown(t *testing.T) {
+	h := newHarness(t)
+	h.adminTransferTo(42, 100, 1, map[string]any{"tip_target_username": "alice"})
+	h.adminTransferTo(43, 50, 2, map[string]any{"tip_target_username": "bob"})
+
+	code, body := h.POST("/api/v1/balances", map[string]any{
+		"discourse_ids": []int64{42, 43, 9999, 42},
+	}, nil)
+	if code != 200 {
+		t.Fatalf("status: %d body=%v", code, body)
+	}
+	if body["count"] != float64(3) {
+		t.Fatalf("deduped count = %v, want 3", body["count"])
+	}
+	accounts, ok := body["accounts"].([]any)
+	if !ok || len(accounts) != 3 {
+		t.Fatalf("accounts shape: %T %v", body["accounts"], body["accounts"])
+	}
+	byID := map[float64]map[string]any{}
+	for _, raw := range accounts {
+		a := raw.(map[string]any)
+		byID[a["discourse_id"].(float64)] = a
+	}
+	if byID[42]["balance"] != float64(100) || byID[43]["balance"] != float64(50) {
+		t.Fatalf("known balances: %v", byID)
+	}
+	if byID[9999]["balance"] != float64(0) || byID[9999]["activated"] != false {
+		t.Fatalf("unknown balance: %v", byID[9999])
+	}
+}
+
+func TestBalances_TooMany_400(t *testing.T) {
+	h := newHarness(t)
+	ids := make([]int64, 201)
+	for i := range ids {
+		ids[i] = int64(i + 1)
+	}
+	code, _ := h.POST("/api/v1/balances", map[string]any{"discourse_ids": ids}, nil)
+	if code != 400 {
+		t.Fatalf("status: %d, want 400", code)
+	}
+}
+
+func TestSecurityHeaders(t *testing.T) {
+	h := newHarness(t)
+	req, _ := http.NewRequest("GET", h.srv.URL+"/api/v1/health", nil)
+	resp, err := h.client.Do(req)
+	if err != nil {
+		t.Fatalf("GET health: %v", err)
+	}
+	defer resp.Body.Close()
+	if got := resp.Header.Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Fatalf("X-Content-Type-Options = %q", got)
+	}
+	if got := resp.Header.Get("Content-Security-Policy"); !strings.Contains(got, "frame-ancestors 'none'") {
+		t.Fatalf("CSP missing frame-ancestors: %q", got)
+	}
+}
+
 // ============================================================================
 // /me + /me/register
 // ============================================================================

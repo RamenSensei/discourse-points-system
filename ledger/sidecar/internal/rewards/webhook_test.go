@@ -22,14 +22,14 @@ type memRewards struct {
 	mu      sync.Mutex
 	amounts map[string]int64
 	enabled map[string]bool
-	events  map[string]struct{}
+	events  map[string][]byte
 }
 
 func newMemRewards() *memRewards {
 	return &memRewards{
 		amounts: map[string]int64{"signup_bonus": 100, "first_post_ever": 50},
 		enabled: map[string]bool{"signup_bonus": true, "first_post_ever": true},
-		events:  map[string]struct{}{},
+		events:  map[string][]byte{},
 	}
 }
 
@@ -50,10 +50,28 @@ func (r *memRewards) RewardEventExists(ctx context.Context, eventType, eventKey 
 	return ok, nil
 }
 
-func (r *memRewards) RecordRewardEvent(ctx context.Context, eventType, eventKey string, _ []byte) error {
+func (r *memRewards) TryReserveRewardEvent(ctx context.Context, eventType, eventKey string) (bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.events[eventType+"/"+eventKey] = struct{}{}
+	k := eventType + "/" + eventKey
+	if _, ok := r.events[k]; ok {
+		return false, nil
+	}
+	r.events[k] = nil
+	return true, nil
+}
+
+func (r *memRewards) CompleteRewardEvent(ctx context.Context, eventType, eventKey string, txHash []byte) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.events[eventType+"/"+eventKey] = bytes.Clone(txHash)
+	return nil
+}
+
+func (r *memRewards) ReleaseRewardEvent(ctx context.Context, eventType, eventKey string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.events, eventType+"/"+eventKey)
 	return nil
 }
 
@@ -120,6 +138,50 @@ func TestSignupBonusPaidOnce(t *testing.T) {
 	alice2, _ := stx2.GetAccountByDiscourseID(context.Background(), 42)
 	if alice2.Balance != 100 {
 		t.Fatalf("dedup failed: alice balance = %d", alice2.Balance)
+	}
+}
+
+func TestPayRewardOnceConcurrentDedup(t *testing.T) {
+	svc, ms, _, _, _ := setupService(t)
+
+	const callers = 16
+	var wg sync.WaitGroup
+	results := make(chan bool, callers)
+	errs := make(chan error, callers)
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			res, err := svc.PayRewardOnce(context.Background(), EventSignupBonus, "user:42", 42, "alice", EventSignupBonus)
+			if err != nil {
+				errs <- err
+				return
+			}
+			results <- res.Paid
+		}()
+	}
+	wg.Wait()
+	close(results)
+	close(errs)
+
+	for err := range errs {
+		t.Fatalf("PayRewardOnce: %v", err)
+	}
+	paid := 0
+	for ok := range results {
+		if ok {
+			paid++
+		}
+	}
+	if paid != 1 {
+		t.Fatalf("paid count = %d, want 1", paid)
+	}
+
+	stx, _ := ms.Begin(context.Background())
+	defer stx.Rollback(context.Background())
+	alice, _ := stx.GetAccountByDiscourseID(context.Background(), 42)
+	if alice == nil || alice.Balance != 100 {
+		t.Fatalf("alice = %+v, want balance 100", alice)
 	}
 }
 

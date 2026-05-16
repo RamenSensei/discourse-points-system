@@ -65,12 +65,11 @@ func (s *Server) logInclusion(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, errors.New("bad leaf_index"))
 		return
 	}
-	hashes, err := s.TxLog.AllTxHashes(r.Context())
+	totalSize, err := s.TxLog.CurrentTreeSize(r.Context())
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
-	totalSize := int64(len(hashes))
 	sz := totalSize
 	if sizeStr != "" {
 		sz, err = strconv.ParseInt(sizeStr, 10, 64)
@@ -83,9 +82,10 @@ func (s *Server) logInclusion(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, errors.New("leaf_index out of range"))
 		return
 	}
-	leafHashes := make([][]byte, sz)
-	for i := int64(0); i < sz; i++ {
-		leafHashes[i] = merkle.LeafHash(hashes[i])
+	leafHashes, err := s.TxLog.LeafHashes(r.Context(), sz)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
 	}
 	proof, err := merkle.InclusionProofFromHashes(leafHashes, int(idx))
 	if err != nil {
@@ -113,18 +113,19 @@ func (s *Server) logConsistency(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, errors.New("require 0 < first <= second"))
 		return
 	}
-	hashes, err := s.TxLog.AllTxHashes(r.Context())
+	totalSize, err := s.TxLog.CurrentTreeSize(r.Context())
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
-	if second > int64(len(hashes)) {
+	if second > totalSize {
 		writeErr(w, http.StatusBadRequest, errors.New("second exceeds current tree size"))
 		return
 	}
-	leafHashes := make([][]byte, second)
-	for i := int64(0); i < second; i++ {
-		leafHashes[i] = merkle.LeafHash(hashes[i])
+	leafHashes, err := s.TxLog.LeafHashes(r.Context(), second)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
 	}
 	proof, err := merkle.ConsistencyProofFromHashes(leafHashes, int(first), int(second))
 	if err != nil {

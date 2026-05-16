@@ -62,6 +62,9 @@ func (h *adminHarness) doRaw(method, path string, body any, cookies map[string]s
 	for k, v := range cookies {
 		req.AddCookie(&http.Cookie{Name: k, Value: v})
 	}
+	if sess := cookies[cookieName]; sess != "" && method != http.MethodGet && method != http.MethodHead && method != http.MethodOptions {
+		req.Header.Set("X-FP-CSRF", csrfToken(h.secret, sess))
+	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		h.t.Fatalf("%s %s: %v", method, path, err)
@@ -367,6 +370,38 @@ func TestProtectedEndpoint_NoCookie_401(t *testing.T) {
 	}
 }
 
+func TestProtectedPost_MissingCSRF_403(t *testing.T) {
+	h := newAdminHarness(t)
+	sess, _ := h.loginAs(h.priv, h.pub)
+	req, _ := http.NewRequest("POST", h.srv.URL+"/admin/api/anchor-sth", nil)
+	req.AddCookie(&http.Cookie{Name: cookieName, Value: sess})
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST anchor-sth: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status: %d, want 403", resp.StatusCode)
+	}
+}
+
+func TestProtectedPost_CrossOrigin_403(t *testing.T) {
+	h := newAdminHarness(t)
+	sess, _ := h.loginAs(h.priv, h.pub)
+	req, _ := http.NewRequest("POST", h.srv.URL+"/admin/api/anchor-sth", nil)
+	req.AddCookie(&http.Cookie{Name: cookieName, Value: sess})
+	req.Header.Set("X-FP-CSRF", csrfToken(h.secret, sess))
+	req.Header.Set("Origin", "https://evil.example")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST anchor-sth: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status: %d, want 403", resp.StatusCode)
+	}
+}
+
 // ============================================================================
 // static / index
 // ============================================================================
@@ -434,6 +469,22 @@ func TestAnchorSTH_NilTxLog_503(t *testing.T) {
 	resp, _ := h.doRaw("POST", "/admin/api/anchor-sth", nil, map[string]string{cookieName: sess})
 	if resp.StatusCode != 503 {
 		t.Fatalf("status: %d, want 503 (no TxLog wired)", resp.StatusCode)
+	}
+}
+
+func TestCalendarAllowed(t *testing.T) {
+	svc := &Service{
+		OTSCalendarURL:       "https://calendar.example/digest/",
+		OTSCalendarAllowlist: []string{"https://backup.example/digest"},
+	}
+	if !svc.calendarAllowed("https://calendar.example/digest") {
+		t.Fatalf("configured calendar should be allowed")
+	}
+	if !svc.calendarAllowed("https://backup.example/digest/") {
+		t.Fatalf("allowlisted calendar should be allowed")
+	}
+	if svc.calendarAllowed("https://metadata.google.internal/") {
+		t.Fatalf("unexpected calendar should be rejected")
 	}
 }
 

@@ -42,13 +42,16 @@ func cmdDistribute(args []string) {
 	if dsn == "" {
 		log.Fatal("DATABASE_URL is required")
 	}
-	privHex := os.Getenv("ADMIN_PRIV_KEY_HEX")
+	privHex := os.Getenv("REWARD_PRIV_KEY_HEX")
 	if privHex == "" {
-		log.Fatal("ADMIN_PRIV_KEY_HEX is required")
+		privHex = os.Getenv("ADMIN_PRIV_KEY_HEX")
+	}
+	if privHex == "" {
+		log.Fatal("REWARD_PRIV_KEY_HEX is required (legacy fallback: ADMIN_PRIV_KEY_HEX)")
 	}
 	priv, err := hex.DecodeString(privHex)
 	if err != nil || len(priv) != ed25519.PrivateKeySize {
-		log.Fatal("ADMIN_PRIV_KEY_HEX must be 128-char hex Ed25519 private key")
+		log.Fatal("REWARD_PRIV_KEY_HEX must be 128-char hex Ed25519 private key")
 	}
 	adminPriv := ed25519.PrivateKey(priv)
 	adminPub := adminPriv.Public().(ed25519.PublicKey)
@@ -140,13 +143,6 @@ type backfillRow struct {
 }
 
 func payIfNotAlready(ctx context.Context, svc *rewards.Service, eventType, eventKey string, dscID int64, username string, dryRun bool) (bool, error) {
-	already, err := svc.Rewards.RewardEventExists(ctx, eventType, eventKey)
-	if err != nil {
-		return false, err
-	}
-	if already {
-		return false, nil
-	}
 	amount, enabled, err := svc.Rewards.GetRewardAmount(ctx, eventType)
 	if err != nil {
 		return false, err
@@ -158,14 +154,11 @@ func payIfNotAlready(ctx context.Context, svc *rewards.Service, eventType, event
 		fmt.Printf("[dry-run] would pay %s amount=%d → user %d (%s)\n", eventType, amount, dscID, username)
 		return true, nil
 	}
-	tx, err := svc.SignAndApplyTransfer(ctx, dscID, username, amount, "backfill:"+eventType)
+	result, err := svc.PayRewardOnce(ctx, eventType, eventKey, dscID, username, "backfill:"+eventType)
 	if err != nil {
 		return false, err
 	}
-	if err := svc.Rewards.RecordRewardEvent(ctx, eventType, eventKey, tx.TxHash); err != nil {
-		log.Printf("WARN: %s/%s dedup record failed but tx applied: %v", eventType, eventKey, err)
-	}
-	return true, nil
+	return result.Paid, nil
 }
 
 // --- stdin CSV feed ---
