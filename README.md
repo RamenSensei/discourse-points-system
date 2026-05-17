@@ -1,5 +1,7 @@
 # Discourse Forum Points
 
+Demo Link: https://riverside.discourse.diy/wallet/explorer/
+
 Open-source, non-invasive points system for Discourse.
 
 It runs as a sidecar service next to Discourse and integrates through a
